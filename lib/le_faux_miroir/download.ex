@@ -1,4 +1,4 @@
-#defmodule Mix.Tasks.Hello do
+# defmodule Mix.Tasks.Hello do
 #  @shortdoc ~S("Example mix task for showing hello world")
 #  use Mix.Task
 #  alias HTTPoison.{AsyncHeaders, AsyncRedirect, AsyncResponse, AsyncStatus, AsyncChunk, AysncEnd}
@@ -32,4 +32,4 @@
 #        File.close(file)
 #    end
 #  end
-#end
+# end

@@ -24,7 +24,7 @@ defmodule LeFauxMiroir.MixProject do
     [
       {:plug_cowboy, "~> 2.0"},
       {:castore, "~> 0.1.0"},
-      {:mint, "~> 1.0"},
+      {:mint, "~> 1.0"}
     ]
   end
 end
