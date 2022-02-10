@@ -1,6 +1,6 @@
 # LeFauxMiroir
 
-**TODO: Add description**
+Reverse HTTP proxy specially tailored to cache Fedora mirror.
 
 ## Installation
 
