@@ -1,3 +1,7 @@
+defmodule QueryPath do
+  defstruct remote: nil, local: nil, local_tmp: nil
+end
+
 defmodule ServeFedora do
   require Logger
   import Plug.Conn
@@ -7,20 +11,32 @@ defmodule ServeFedora do
     options
   end
 
-  def sanitized_path(%{path_info: ["linux" | path_info]}) do
-    path =
-      Enum.filter(path_info, fn x -> String.match?(x, ~r/^[A-Za-z\d][\dA-Za-z_\.-]*$/) end)
+  def construct_path(%{path_info: ["linux" | path_info]}) do
+    Logger.info(path_info)
+
+    remote_path =
+      Enum.filter(path_info, fn x -> String.match?(x, ~r/^[A-Za-z\d][\d~A-Za-z_\.-]*$/) end)
       |> Enum.join("/")
 
-    "linux/" <> path
+    cache_directory = "/home/goneri/tmp/my-cache"
+
+    local_path = "#{cache_directory}/#{remote_path}"
+
+    prefix = for _ <- 1..20, into: "", do: <<Enum.random('0123456789abcdef')>>
+    local_tmp_path = local_path <> prefix <> ".tmp"
+    File.mkdir_p!(Path.dirname(local_path))
+
+    Logger.info("Asking #{remote_path}")
+    %QueryPath{remote: remote_path, local: local_path, local_tmp: local_tmp_path}
   end
 
-  def call(conn, _opts) do
-    path = sanitized_path(conn)
-
+  def find_remote_mirror(conn, path) do
     mirrors = [
-      %{scheme: :http, address: "some-bad-mirror", port: 80},
-      %{scheme: :http, address: "mirror.facebook.net", port: 80}
+      %{scheme: :http, address: "fedora.mirror.iweb.com", port: 80, base_dir: "/linux"},
+      %{scheme: :http, address: "some-bad-mirror", port: 80, base_dir: "/"},
+      %{scheme: :http, address: "mirror.facebook.net", port: 80, base_dir: "/fedora"},
+      %{scheme: :http, address: "mirror.facebook.net", port: 80, base_dir: "/nowhere"},
+      %{scheme: :https, address: "mirror.dst.ca", port: 443, base_dir: "/fedora"}
     ]
 
     mirror_used =
@@ -30,8 +46,9 @@ defmodule ServeFedora do
         fn x ->
           case Mint.HTTP.connect(x.scheme, x.address, x.port, timeout: 0.5, mode: :passive) do
             {:ok, download_conn} ->
-              case maybe_download(conn, download_conn, path) do
+              case fetch_and_send(conn, download_conn, x.base_dir, path) do
                 :ok ->
+                  Logger.info("File found on #{x.address}")
                   true
 
                 _ ->
@@ -45,6 +62,9 @@ defmodule ServeFedora do
         end
       )
 
+    # NOTE: We never reach this part if everything went ok because
+    # Plug will kill the process as soon as the data have been to the
+    # client.
     case mirror_used do
       nil ->
         conn
@@ -56,13 +76,32 @@ defmodule ServeFedora do
     end
   end
 
-  def maybe_download(conn, download_conn, path) do
-    cache_directory = "/home/goneri/tmp/my-cache"
-    final_path = cache_directory <> path
-    # TODO UNSAFE
-    temp_path = cache_directory <> path <> ".temp"
+  def call(conn, _opts) do
+    path = construct_path(conn)
 
-    {:ok, fd} = File.open(temp_path, [:write, :binary])
+    case File.stat(path.local) do
+      {:ok, %File.Stat{ctime: ctime}} ->
+        datetime = NaiveDateTime.from_erl!(ctime) |> DateTime.from_naive!("Etc/UTC")
+        max_age = DateTime.add(datetime, 3600, :second)
+
+        case Timex.compare(max_age, Timex.now()) do
+          1 ->
+            Logger.info("Send file #{path.local}")
+            Plug.Conn.send_file(conn, 200, path.local)
+
+          -1 ->
+            find_remote_mirror(conn, path)
+        end
+
+      {:error, reason} ->
+        Logger.info("Cannot find requested file in the local cache: #{reason}")
+        find_remote_mirror(conn, path)
+    end
+  end
+
+  def fetch_and_send(conn, download_conn, base_dir, path) do
+    Logger.info("Openining #{path.local_tmp}")
+    {:ok, fd} = File.open(path.local_tmp, [:write, :binary])
 
     file_writer = fn moar_content, expected_size ->
       :ok = IO.binwrite(fd, moar_content)
@@ -70,21 +109,32 @@ defmodule ServeFedora do
 
       if cur == expected_size do
         :ok = File.close(fd)
-        Logger.info("Final file: #{final_path}")
-        :ok = File.rename(temp_path, final_path)
+        Logger.info("Final file: #{path.local}")
+        :ok = File.rename(path.local_tmp, path.local)
       end
     end
 
-    {:ok, download_conn, request_ref} =
-      Mint.HTTP.request(download_conn, "GET", "/fedora/#{path}", [], nil)
+    Logger.info("GET #{base_dir}/#{path.remote}")
+
+    {:ok, download_conn, _request_ref} =
+      Mint.HTTP.request(download_conn, "GET", "#{base_dir}/#{path.remote}", [], nil)
 
     get_chunk(conn, download_conn, file_writer)
   end
 
   def handle_message(
+        {:ok, %Plug.Conn{} = conn, download_conn},
+        _file_writer,
+        {:done, _}
+      ) do
+    Logger.info("Done!")
+    {:ok, conn, download_conn}
+  end
+
+  def handle_message(
         {:ok, %Plug.Conn{state: :unset} = conn, download_conn},
-        file_writer,
-        {:status, request_ref, status_code = 200}
+        _file_writer,
+        {:status, _request_ref, status_code = 200}
       ) do
     Logger.info("status code: #{status_code}")
     {:ok, conn, download_conn}
@@ -92,8 +142,8 @@ defmodule ServeFedora do
 
   def handle_message(
         {:ok, %Plug.Conn{state: :unset} = conn, download_conn},
-        file_writer,
-        {:status, request_ref, status_code = 404}
+        _file_writer,
+        {:status, _request_ref, _status_code = 404}
       ) do
     Mint.HTTP.close(download_conn)
     {:notFound, conn, download_conn}
@@ -101,8 +151,8 @@ defmodule ServeFedora do
 
   def handle_message(
         {:ok, %Plug.Conn{state: :unset} = conn, download_conn},
-        file_writer,
-        {:headers, request_ref, headers}
+        _file_writer,
+        {:headers, _request_ref, headers}
       ) do
     conn = Plug.Conn.prepend_resp_headers(conn, headers)
     conn = Plug.Conn.send_chunked(conn, 200)
@@ -111,8 +161,8 @@ defmodule ServeFedora do
 
   def handle_message(
         {:ok, %Plug.Conn{} = conn, download_conn},
-        file_writer,
-        {:ok, download_conn, responses}
+        _file_writer,
+        {:ok, download_conn, _responses}
       ) do
     {:ok, conn, download_conn}
   end
@@ -133,48 +183,61 @@ defmodule ServeFedora do
   def handle_message(
         {:ok, %Plug.Conn{state: :chunked} = conn, download_conn},
         file_writer,
-        {:data, request_ref, binary}
+        {:data, _request_ref, binary}
       ) do
     file_writer.(binary, content_lenght(conn))
     {:ok, conn} = Plug.Conn.chunk(conn, binary)
     {:ok, conn, download_conn}
   end
 
-  @doc """
-  We actually never reach this step because the client will disconnect before
-  and trigger the destruction of the process.
-  """
-  def handle_message({:ok, conn, download_conn}, file_writer, {:done, request_ref}) do
+  def handle_message(
+        {:done, %Plug.Conn{state: :unset} = conn, download_conn},
+        _file_writer,
+        _
+      ) do
     Mint.HTTP.close(download_conn)
-    {:done, conn, download_conn}
+    {:done, conn, nil}
   end
 
-  def content_lenght(%Plug.Conn{state: :chunked, resp_headers: resp_headers} = conn) do
+  def handle_message(
+        {:done, %Plug.Conn{state: :closed} = conn, download_conn},
+        _file_writer,
+        _
+      ) do
+    Mint.HTTP.close(download_conn)
+    {:done, conn, nil}
+  end
+
+  def handle_message({:notFound, _conn, _}, _, _) do
+    Logger.info("File not found on mirror.")
+    {:notFound, nil, nil}
+  end
+
+  def content_lenght(%Plug.Conn{state: :chunked, resp_headers: resp_headers} = _conn) do
     resp_headers
     |> Enum.find(fn x -> elem(x, 0) == "content-length" end)
     |> elem(1)
     |> String.to_integer()
   end
 
-  def handle_message({:notFound, _, _}, _) do
-    {:notFound, nil, nil}
-  end
-
   def handle_responses(conn, download_conn, file_writer, responses) do
-    status = nil
     acc = {:ok, conn, download_conn}
     Enum.reduce(responses, acc, &handle_message(&2, file_writer, &1))
   end
 
   def get_chunk(conn, download_conn, file_writer) do
-    {:ok, download_conn, responses} = Mint.HTTP.recv(download_conn, 0, 1000)
+    case Mint.HTTP.recv(download_conn, 0, 1000) do
+      {:ok, download_conn, responses} ->
+        case handle_responses(conn, download_conn, file_writer, responses) do
+          {:ok, %Plug.Conn{state: :chunked} = conn, download_conn} ->
+            {:ok} = get_chunk(conn, download_conn, file_writer)
 
-    case handle_responses(conn, download_conn, file_writer, responses) do
-      {:ok, %Plug.Conn{state: :chunked} = conn, download_conn} ->
-        {:ok} = get_chunk(conn, download_conn, file_writer)
+          {:notFound, _, _} ->
+            :skip_this_mirror
+        end
 
-      {:notFound, nil, nil} ->
-        :notFound
+      {:error, _, %Mint.TransportError{reason: :timeout}} ->
+        :skip_this_mirror
     end
   end
 end
